@@ -1,20 +1,33 @@
+// csar-botverify bridges Telegram (and future) bot webhooks with the
+// csar-authn bot-verify confirm endpoint. It receives platform webhook
+// callbacks, extracts a verification code from user messages, and
+// relays a confirm call to csar-authn via the csar router using STS
+// service tokens.
 package main
 
 import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"gopkg.in/yaml.v3"
 
-	"github.com/ledatu/aurumskynet-core/app"
+	"github.com/ledatu/csar-core/configload"
+	"github.com/ledatu/csar-core/gatewayctx"
+	"github.com/ledatu/csar-core/health"
+	"github.com/ledatu/csar-core/httpmiddleware"
+	"github.com/ledatu/csar-core/httpserver"
 	"github.com/ledatu/csar-core/jwtx"
+	"github.com/ledatu/csar-core/logutil"
+	"github.com/ledatu/csar-core/observe"
 	"github.com/ledatu/csar-core/stsclient"
+	"github.com/ledatu/csar-core/tlsx"
 
 	"github.com/ledatu/csar-botverify/internal/config"
 	"github.com/ledatu/csar-botverify/internal/provider"
@@ -22,87 +35,138 @@ import (
 	"github.com/ledatu/csar-botverify/internal/relay"
 )
 
+var Version = "dev"
+
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	sf := configload.NewSourceFlags()
+	sf.RegisterFlags(flag.CommandLine)
+	flag.Parse()
 
-	a := app.New("", logger,
-		app.WithoutAMQP(),
-		app.WithoutPostgres(),
-	)
+	inner := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	logger := slog.New(logutil.NewRedactingHandler(inner))
 
-	a.RegisterRoutes(func(r chi.Router) {
-		custom := parseCustomConfig(a.Config.Custom, logger)
-
-		kp, err := jwtx.LoadKeyPairFromPEM(custom.JWT.PrivateKeyFile, custom.JWT.PublicKeyFile)
-		if err != nil {
-			logger.Error("load jwt keys", "error", err)
-			os.Exit(1)
-		}
-
-		internalTransport := buildInternalTransport(custom, logger)
-
-		ts, err := stsclient.New(&stsclient.Config{
-			STSEndpoint:       custom.STSEndpoint,
-			Audience:          custom.Audience,
-			ServiceName:       custom.ServiceName,
-			AssertionAudience: custom.AssertionAudience,
-			KeyPair:           kp,
-			AssertionTTL:      4 * time.Minute,
-			HTTPClient: &http.Client{
-				Transport: internalTransport,
-				Timeout:   30 * time.Second,
-			},
-			Logger: logger,
-		})
-		if err != nil {
-			logger.Error("sts client", "error", err)
-			os.Exit(1)
-		}
-
-		stsHTTPClient := &http.Client{
-			Transport: ts.Transport(internalTransport),
-			Timeout:   30 * time.Second,
-		}
-
-		providers := make(map[string]provider.BotProvider)
-		for _, pc := range custom.Providers {
-			switch pc.Name {
-			case "telegram":
-				tg := telegram.New(pc.BotToken, pc.WebhookSecret, logger)
-				providers["telegram"] = tg
-
-				if pc.WebhookURL != "" {
-					if err := tg.RegisterWebhook(context.Background(), pc.WebhookURL); err != nil {
-						logger.Error("failed to register telegram webhook", "error", err)
-						os.Exit(1)
-					}
-				}
-			default:
-				logger.Warn("unknown bot provider, skipping", "name", pc.Name)
-			}
-		}
-
-		confirmURL := custom.RouterBaseURL + "/svc/authn/bot-verify/confirm"
-		relayHandler := relay.New(providers, confirmURL, stsHTTPClient, logger)
-
-		r.Post("/webhook/{provider}", relayHandler.HandleWebhook)
-	})
-
-	if err := a.Run(); err != nil {
+	if err := run(sf, logger); err != nil {
 		logger.Error("fatal", "error", err)
 		os.Exit(1)
 	}
 }
 
-func parseCustomConfig(node yaml.Node, logger *slog.Logger) config.Custom {
-	var c config.Custom
-	if err := node.Decode(&c); err != nil {
-		logger.Error("failed to parse custom config", "error", err)
-		os.Exit(1)
+func run(sf *configload.SourceFlags, logger *slog.Logger) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srcParams := sf.SourceParams()
+	cfg, err := configload.LoadInitial(ctx, &srcParams, logger, config.LoadFromBytes)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
 	}
-	return c
+	logger.Info("config loaded",
+		"service", cfg.Service.Name,
+		"port", cfg.Service.Port,
+		"tls", cfg.TLS.IsEnabled(),
+	)
+
+	// --- Observability ---
+	tp, err := observe.InitTracer(ctx, observe.TraceConfig{
+		ServiceName:    cfg.Service.Name,
+		ServiceVersion: Version,
+		Endpoint:       cfg.Tracing.Endpoint,
+		SampleRate:     cfg.Tracing.SampleRate,
+		Insecure:       true,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing tracer: %w", err)
+	}
+	defer func() { _ = tp.Close() }()
+
+	// --- STS client for authenticating relay calls ---
+	kp, err := jwtx.LoadKeyPairFromPEM(cfg.Custom.JWT.PrivateKeyFile, cfg.Custom.JWT.PublicKeyFile)
+	if err != nil {
+		return fmt.Errorf("loading jwt keys: %w", err)
+	}
+
+	internalTransport := buildInternalTransport(cfg.Custom, logger)
+
+	ts, err := stsclient.New(&stsclient.Config{
+		STSEndpoint:       cfg.Custom.STSEndpoint,
+		Audience:          cfg.Custom.Audience,
+		ServiceName:       cfg.Custom.ServiceName,
+		AssertionAudience: cfg.Custom.AssertionAudience,
+		KeyPair:           kp,
+		AssertionTTL:      4 * time.Minute,
+		HTTPClient: &http.Client{
+			Transport: internalTransport,
+			Timeout:   30 * time.Second,
+		},
+		Logger: logger,
+	})
+	if err != nil {
+		return fmt.Errorf("sts client: %w", err)
+	}
+
+	stsHTTPClient := &http.Client{
+		Transport: ts.Transport(internalTransport),
+		Timeout:   30 * time.Second,
+	}
+
+	// --- Bot providers ---
+	providers := make(map[string]provider.BotProvider)
+	for _, pc := range cfg.Custom.Providers {
+		switch pc.Name {
+		case "telegram":
+			tg := telegram.New(pc.BotToken, pc.WebhookSecret, logger)
+			providers["telegram"] = tg
+			if pc.WebhookURL != "" {
+				if err := tg.RegisterWebhook(ctx, pc.WebhookURL); err != nil {
+					return fmt.Errorf("registering telegram webhook: %w", err)
+				}
+			}
+		default:
+			logger.Warn("unknown bot provider, skipping", "name", pc.Name)
+		}
+	}
+
+	confirmURL := cfg.Custom.RouterBaseURL + "/svc/authn/bot-verify/confirm"
+	relayHandler := relay.New(providers, confirmURL, stsHTTPClient, logger)
+
+	// --- Router ---
+	r := chi.NewRouter()
+	r.Use(
+		httpmiddleware.RequestID,
+		httpmiddleware.AccessLog(logger),
+		httpmiddleware.Recover(logger),
+		httpmiddleware.MaxBodySize(1<<20),
+		gatewayctx.Middleware,
+	)
+	r.Get("/health", health.Handler(Version))
+	rc := health.NewReadinessChecker(Version, true)
+	r.Get("/readiness", rc.Handler())
+	r.Post("/webhook/{provider}", relayHandler.HandleWebhook)
+
+	// --- HTTP server ---
+	addr := fmt.Sprintf(":%d", cfg.Service.Port)
+
+	var tlsCfg *tlsx.ServerConfig
+	if cfg.TLS.IsEnabled() {
+		tlsCfg = &tlsx.ServerConfig{
+			CertFile:     cfg.TLS.CertFile,
+			KeyFile:      cfg.TLS.KeyFile,
+			ClientCAFile: cfg.TLS.ClientCAFile,
+			MinVersion:   cfg.TLS.MinVersion,
+		}
+	}
+
+	srv, err := httpserver.New(&httpserver.Config{
+		Addr:    addr,
+		Handler: r,
+		TLS:     tlsCfg,
+	}, logger)
+	if err != nil {
+		return fmt.Errorf("creating server: %w", err)
+	}
+
+	logger.Info("service started", "name", cfg.Service.Name, "port", cfg.Service.Port, "tls", cfg.TLS.IsEnabled())
+	return srv.Run(ctx)
 }
 
 func buildInternalTransport(custom config.Custom, logger *slog.Logger) http.RoundTripper {
