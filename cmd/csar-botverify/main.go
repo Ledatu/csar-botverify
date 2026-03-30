@@ -10,7 +10,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -109,10 +111,33 @@ func run(sf *configload.SourceFlags, logger *slog.Logger) error {
 		httpmiddleware.MaxBodySize(1<<20),
 		gatewayctx.Middleware,
 	)
-	r.Get("/health", health.Handler(Version))
 	readiness := health.NewReadinessChecker(Version, true)
-	r.Get("/readiness", readiness.Handler())
+	readiness.Register("http_server", health.TCPDialCheck(fmt.Sprintf(":%d", cfg.Service.Port), time.Second))
+	if cfg.HealthPort == 0 {
+		r.Get("/health", health.Handler(Version))
+		r.Get("/readiness", readiness.Handler())
+	}
 	r.Post("/webhook/{provider}", relayHandler.HandleWebhook)
+
+	var healthSidecar *health.Sidecar
+	if cfg.HealthPort > 0 {
+		var err error
+		healthSidecar, err = health.NewSidecar(health.SidecarConfig{
+			Addr:      fmt.Sprintf("127.0.0.1:%d", cfg.HealthPort),
+			Version:   Version,
+			Readiness: readiness,
+			Logger:    logger,
+		})
+		if err != nil {
+			return fmt.Errorf("health sidecar: %w", err)
+		}
+		go func() {
+			if err := healthSidecar.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("health sidecar error", "error", err)
+			}
+		}()
+		logger.Info("health sidecar started", "port", cfg.HealthPort)
+	}
 
 	// --- HTTP server ---
 	addr := fmt.Sprintf(":%d", cfg.Service.Port)
@@ -137,5 +162,13 @@ func run(sf *configload.SourceFlags, logger *slog.Logger) error {
 	}
 
 	logger.Info("service started", "name", cfg.Service.Name, "port", cfg.Service.Port, "tls", cfg.TLS.IsEnabled())
-	return srv.Run(ctx)
+	runErr := srv.Run(ctx)
+	if healthSidecar != nil {
+		hctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if serr := healthSidecar.Shutdown(hctx); serr != nil {
+			logger.Error("health sidecar shutdown error", "error", serr)
+		}
+	}
+	return runErr
 }

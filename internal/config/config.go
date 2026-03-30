@@ -16,6 +16,7 @@ type Config struct {
 	TLS         configutil.TLSSection       `yaml:"tls"`
 	Tracing     TracingSection              `yaml:"tracing"`
 	ServiceAuth stsclient.ServiceAuthConfig `yaml:"service_auth"`
+	HealthPort  int                         `yaml:"health_port"`
 	Custom      Custom                      `yaml:"custom"`
 }
 
@@ -59,6 +60,12 @@ func LoadFromBytes(data []byte) (*Config, error) {
 	}
 	if cfg.Service.Port == 0 {
 		return nil, fmt.Errorf("config: service.port is required")
+	}
+	if cfg.HealthPort < 0 {
+		return nil, fmt.Errorf("config: health_port must be positive")
+	}
+	if cfg.HealthPort > 0 && cfg.HealthPort == cfg.Service.Port {
+		return nil, fmt.Errorf("config: health_port must differ from service.port")
 	}
 	if err := cfg.TLS.Validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
