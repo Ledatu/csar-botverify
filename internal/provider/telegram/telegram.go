@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/ledatu/csar-botverify/internal/provider"
 )
@@ -35,6 +36,23 @@ func New(token, webhookSecret string, logger *slog.Logger) *Provider {
 }
 
 func (p *Provider) Name() string { return "telegram" }
+
+func extractVerificationCode(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+
+	fields := strings.Fields(trimmed)
+	if strings.EqualFold(fields[0], "/start") {
+		if len(fields) < 2 {
+			return ""
+		}
+		return strings.ToUpper(strings.TrimSpace(fields[1]))
+	}
+
+	return strings.ToUpper(trimmed)
+}
 
 // ValidateWebhook checks the X-Telegram-Bot-Api-Secret-Token header.
 func (p *Provider) ValidateWebhook(r *http.Request) bool {
@@ -81,7 +99,7 @@ func (p *Provider) ParseWebhook(r *http.Request) (*provider.IncomingMessage, err
 		ProviderUserID: strconv.FormatInt(update.Message.From.ID, 10),
 		DisplayName:    displayName,
 		ChatID:         strconv.FormatInt(update.Message.Chat.ID, 10),
-		Text:           update.Message.Text,
+		Text:           extractVerificationCode(update.Message.Text),
 	}, nil
 }
 
