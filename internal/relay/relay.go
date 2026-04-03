@@ -65,7 +65,7 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	status, err := h.confirm(r, code, providerName, msg.ProviderUserID, msg.DisplayName)
 	if err != nil {
 		h.logger.Error("confirm call failed", "provider", providerName, "error", err)
-		_ = bp.SendReply(r.Context(), msg.ChatID, "An error occurred. Please try again later.")
+		_ = bp.SendReply(r.Context(), msg.ChatID, "Не удалось подтвердить код. Попробуйте ещё раз немного позже.")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -76,12 +76,12 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 			"provider", providerName,
 			"provider_user_id", msg.ProviderUserID,
 		)
-		_ = bp.SendReply(r.Context(), msg.ChatID, "Code accepted! Return to your browser.")
+		_ = bp.SendReply(r.Context(), msg.ChatID, "Код принят. Вернитесь в браузер и завершите вход.")
 	case http.StatusNotFound:
-		_ = bp.SendReply(r.Context(), msg.ChatID, "Invalid or expired code. Please try again.")
+		_ = bp.SendReply(r.Context(), msg.ChatID, "Код недействителен или уже истёк. Запросите новый код и попробуйте снова.")
 	default:
 		h.logger.Warn("unexpected confirm status", "status", status, "provider", providerName)
-		_ = bp.SendReply(r.Context(), msg.ChatID, "Something went wrong. Please try again.")
+		_ = bp.SendReply(r.Context(), msg.ChatID, "Что-то пошло не так. Попробуйте ещё раз.")
 	}
 
 	w.WriteHeader(http.StatusOK)
