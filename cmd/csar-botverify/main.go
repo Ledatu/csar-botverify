@@ -123,7 +123,7 @@ func run(sf *configload.SourceFlags, logger *slog.Logger) error {
 	if cfg.HealthPort > 0 {
 		var err error
 		healthSidecar, err = health.NewSidecar(health.SidecarConfig{
-			Addr:      fmt.Sprintf("127.0.0.1:%d", cfg.HealthPort),
+			Addr:      fmt.Sprintf(":%d", cfg.HealthPort),
 			Version:   Version,
 			Readiness: readiness,
 			Logger:    logger,
