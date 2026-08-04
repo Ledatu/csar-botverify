@@ -12,6 +12,10 @@ type IncomingMessage struct {
 	DisplayName    string
 	ChatID         string // for sending reply
 	Text           string
+	// IsStart reports that the message was a bare /start with no payload: the
+	// user opened the bot directly instead of following a deep link, so there
+	// is no code to confirm and they need to be told what to do next.
+	IsStart bool
 }
 
 // BotProvider abstracts messenger bot operations for a single platform.

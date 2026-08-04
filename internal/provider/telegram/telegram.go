@@ -37,21 +37,35 @@ func New(token, webhookSecret string, logger *slog.Logger) *Provider {
 
 func (p *Provider) Name() string { return "telegram" }
 
-func extractVerificationCode(text string) string {
+// parseMessage classifies incoming message text. It returns the verification
+// code the message carries, and whether the message was a bare /start with no
+// payload — the case where a user opens the bot from Telegram search instead of
+// a t.me/<bot>?start=<code> deep link, leaving nothing to confirm.
+func parseMessage(text string) (code string, bareStart bool) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
-		return ""
+		return "", false
 	}
 
 	fields := strings.Fields(trimmed)
-	if strings.EqualFold(fields[0], "/start") {
+	if isStartCommand(fields[0]) {
 		if len(fields) < 2 {
-			return ""
+			return "", true
 		}
-		return strings.ToUpper(strings.TrimSpace(fields[1]))
+		return strings.ToUpper(strings.TrimSpace(fields[1])), false
 	}
 
-	return strings.ToUpper(trimmed)
+	return strings.ToUpper(trimmed), false
+}
+
+// isStartCommand matches /start, including the /start@botname form Telegram
+// sends in group chats. Without stripping the suffix the whole command would be
+// mistaken for a verification code.
+func isStartCommand(field string) bool {
+	if at := strings.IndexByte(field, '@'); at != -1 {
+		field = field[:at]
+	}
+	return strings.EqualFold(field, "/start")
 }
 
 // ValidateWebhook checks the X-Telegram-Bot-Api-Secret-Token header.
@@ -95,11 +109,14 @@ func (p *Provider) ParseWebhook(r *http.Request) (*provider.IncomingMessage, err
 		displayName += " " + update.Message.From.LastName
 	}
 
+	code, bareStart := parseMessage(update.Message.Text)
+
 	return &provider.IncomingMessage{
 		ProviderUserID: strconv.FormatInt(update.Message.From.ID, 10),
 		DisplayName:    displayName,
 		ChatID:         strconv.FormatInt(update.Message.Chat.ID, 10),
-		Text:           extractVerificationCode(update.Message.Text),
+		Text:           code,
+		IsStart:        bareStart,
 	}, nil
 }
 

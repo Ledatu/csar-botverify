@@ -13,6 +13,12 @@ import (
 	"github.com/ledatu/csar-botverify/internal/provider"
 )
 
+// startMessage answers a bare /start. The bot's intended entry point is a
+// t.me/<bot>?start=<code> deep link from the login page, so a user arriving any
+// other way has no code attached and needs pointing back to it.
+const startMessage = "Это бот подтверждения входа AURUMSKYNET.\n\n" +
+	"Отправьте сюда код подтверждения со страницы входа — или откройте бота по ссылке с кодом, которую вы получили в браузере."
+
 // Handler routes incoming bot webhooks to the appropriate provider and relays
 // confirmation to csar-authn.
 type Handler struct {
@@ -58,6 +64,14 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	code := strings.TrimSpace(strings.ToUpper(msg.Text))
 	if code == "" {
+		// A bare /start carries no code to confirm, but answering it matters:
+		// users who find the bot through search rather than a deep link would
+		// otherwise see no response at all. Other empty updates (stickers,
+		// photos) stay silent.
+		if msg.IsStart {
+			h.logger.Info("start command without payload", "provider", providerName)
+			_ = bp.SendReply(r.Context(), msg.ChatID, startMessage)
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
