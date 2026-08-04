@@ -37,6 +37,51 @@ func New(token, webhookSecret string, logger *slog.Logger) *Provider {
 
 func (p *Provider) Name() string { return "telegram" }
 
+// redactedToken replaces the bot token wherever it would otherwise be exposed.
+const redactedToken = "[REDACTED]"
+
+// apiURL builds the endpoint for a Bot API method. The token sits in the URL
+// path, so anything derived from this string — including errors returned by
+// net/http — must go through redactErr before it reaches a log sink.
+func (p *Provider) apiURL(method string) string {
+	return apiBase + p.token + "/" + method
+}
+
+// redactedError hides the bot token in an error's message while keeping the
+// original error reachable for errors.Is/errors.As.
+type redactedError struct {
+	msg   string
+	inner error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+func (e *redactedError) Unwrap() error { return e.inner }
+
+// redactString strips the bot token out of s.
+func (p *Provider) redactString(s string) string {
+	// ReplaceAll with an empty token would splice the placeholder between
+	// every character, so an unset token must short-circuit.
+	if p.token == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, p.token, redactedToken)
+}
+
+// redactErr strips the bot token from err's message. net/http embeds the full
+// request URL in *url.Error, so an unredacted transport failure — a DNS error
+// or an i/o timeout on setWebhook — writes the token straight into the logs.
+func (p *Provider) redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	redacted := p.redactString(msg)
+	if redacted == msg {
+		return err
+	}
+	return &redactedError{msg: redacted, inner: err}
+}
+
 // parseMessage classifies incoming message text. It returns the verification
 // code the message carries, and whether the message was a bare /start with no
 // payload — the case where a user opens the bot from Telegram search instead of
@@ -128,22 +173,21 @@ func (p *Provider) RegisterWebhook(ctx context.Context, webhookURL string) error
 	}
 	body, _ := json.Marshal(payload)
 
-	url := apiBase + p.token + "/setWebhook"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiURL("setWebhook"), bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return fmt.Errorf("creating request: %w", p.redactErr(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("calling setWebhook: %w", err)
+		return fmt.Errorf("calling setWebhook: %w", p.redactErr(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		return fmt.Errorf("setWebhook returned %d: %s", resp.StatusCode, respBody)
+		return fmt.Errorf("setWebhook returned %d: %s", resp.StatusCode, p.redactString(string(respBody)))
 	}
 
 	p.logger.Info("telegram webhook registered", "url", webhookURL)
@@ -158,22 +202,21 @@ func (p *Provider) SendReply(ctx context.Context, chatID, text string) error {
 	}
 	body, _ := json.Marshal(payload)
 
-	url := apiBase + p.token + "/sendMessage"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiURL("sendMessage"), bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("creating request: %w", err)
+		return fmt.Errorf("creating request: %w", p.redactErr(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("calling sendMessage: %w", err)
+		return fmt.Errorf("calling sendMessage: %w", p.redactErr(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		p.logger.Warn("sendMessage failed", "status", resp.StatusCode, "body", string(respBody))
+		p.logger.Warn("sendMessage failed", "status", resp.StatusCode, "body", p.redactString(string(respBody)))
 	}
 	return nil
 }
