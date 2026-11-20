@@ -28,12 +28,13 @@ type Processor interface {
 // Receiver keeps the offset in memory. Telegram retains its last acknowledged
 // offset across replica failover. An unacknowledged update is safely replayed.
 type Receiver struct {
-	Client    Client
-	Processor Processor
-	Locker    lock.SessionLocker
-	Key       string
-	Owner     string
-	Logger    *slog.Logger
+	Client        Client
+	Processor     Processor
+	Locker        lock.SessionLocker
+	Key           string
+	Owner         string
+	Logger        *slog.Logger
+	FailoverAfter time.Duration
 
 	active       atomic.Bool
 	lastPoll     atomic.Int64
@@ -91,14 +92,26 @@ func (r *Receiver) Run(ctx context.Context) {
 			}
 			continue
 		}
-		r.serveSession(ctx, session)
-		if !wait(ctx, 3*time.Second) {
+		err = r.serveSession(ctx, session)
+		if ctx.Err() != nil {
+			return
+		}
+		delay := 3 * time.Second
+		if err != nil {
+			r.recordError("session", err)
+			// Yield to healthy peers before this receiver competes again.
+			delay = retryDelay(err)
+			if delay < 30*time.Second {
+				delay = 30 * time.Second
+			}
+		}
+		if !wait(ctx, delay) {
 			return
 		}
 	}
 }
 
-func (r *Receiver) serveSession(ctx context.Context, session *lock.Session) {
+func (r *Receiver) serveSession(ctx context.Context, session *lock.Session) error {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -122,28 +135,42 @@ func (r *Receiver) serveSession(ctx context.Context, session *lock.Session) {
 
 	if err := r.Client.CheckPolling(sessionCtx); err != nil {
 		r.recordError("webhook", err)
-		return
+		return err
 	}
-	r.receive(sessionCtx)
+	return r.receive(sessionCtx)
 }
 
-func (r *Receiver) receive(ctx context.Context) {
+func (r *Receiver) receive(ctx context.Context) error {
 	var offset int64
+	var failedSince time.Time
 	for ctx.Err() == nil {
+		if !failedSince.IsZero() && time.Since(failedSince) >= r.FailoverAfter {
+			return fmt.Errorf("polling delivery stalled beyond failover window")
+		}
 		updates, err := r.Client.GetUpdates(ctx, offset)
 		if err != nil {
 			r.recordError("receive", err)
-			if !wait(ctx, retryDelay(err)) {
-				return
+			if failedSince.IsZero() {
+				failedSince = time.Now()
+			}
+			delay := retryDelay(err)
+			if delay >= r.FailoverAfter {
+				return err
+			}
+			if !wait(ctx, delay) {
+				return ctx.Err()
 			}
 			continue
+		}
+		if len(updates) == 0 {
+			failedSince = time.Time{}
 		}
 		now := time.Now().Unix()
 		r.lastPoll.Store(now)
 		r.pollMetric.Set(float64(now))
 		for _, update := range updates {
 			if ctx.Err() != nil {
-				return
+				return ctx.Err()
 			}
 			if update.ID < offset {
 				continue
@@ -151,18 +178,27 @@ func (r *Receiver) receive(ctx context.Context) {
 			if message := update.Incoming(); message != nil {
 				if err := r.Processor.Process(ctx, "telegram", message); err != nil {
 					r.recordError("process", err)
-					if !wait(ctx, retryDelay(err)) {
-						return
+					if failedSince.IsZero() {
+						failedSince = time.Now()
+					}
+					delay := retryDelay(err)
+					if delay >= r.FailoverAfter {
+						return err
+					}
+					if !wait(ctx, delay) {
+						return ctx.Err()
 					}
 					// Stop this batch. A later offset must never acknowledge a
 					// failed earlier update.
 					break
 				}
 			}
+			failedSince = time.Time{}
 			offset = update.ID + 1
 			r.updateMetric.Set(float64(time.Now().Unix()))
 		}
 	}
+	return ctx.Err()
 }
 
 func retryDelay(err error) time.Duration {
@@ -186,7 +222,7 @@ func wait(ctx context.Context, delay time.Duration) bool {
 
 // Validate checks the runtime dependencies before any Telegram mutation.
 func (r *Receiver) Validate() error {
-	if r.Client == nil || r.Processor == nil || r.Locker == nil || r.Key == "" || r.Owner == "" {
+	if r.Client == nil || r.Processor == nil || r.Locker == nil || r.Key == "" || r.Owner == "" || r.FailoverAfter <= 0 {
 		return fmt.Errorf("polling receiver dependencies are required")
 	}
 	return nil
