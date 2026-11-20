@@ -152,7 +152,7 @@ func run(sf *configload.SourceFlags, logger *slog.Logger) error {
 		}
 		receiver := &polling.Receiver{
 			Client: pollingProvider, Processor: relayHandler,
-			Locker: lock.NewRedisLocker(rdb), Key: pollingKey, Owner: owner, Logger: logger,
+			Locker: lock.NewRedisLocker(rdb), Key: pollingKey, Owner: owner, Logger: logger, FailoverAfter: time.Minute,
 		}
 		if err := receiver.Validate(); err != nil {
 			return err

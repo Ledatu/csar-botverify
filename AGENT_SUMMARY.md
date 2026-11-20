@@ -61,3 +61,8 @@ Webhook and elected long-polling relay for bot verification. It receives provide
   prevents issuing another session from an already consumed verification.
 - Health includes Redis and receiver progress. The health sidecar exposes
   polling mode/ownership, success timestamps and error counters at /metrics.
+
+- An owner that cannot fetch or process messages for one minute releases its
+  session and waits at least thirty seconds before competing again. Long
+  Telegram retry-after delays release ownership and are respected outside the
+  session, allowing healthy peers to take over.
