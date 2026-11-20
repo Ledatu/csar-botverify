@@ -4,11 +4,14 @@ package relay
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ledatu/csar-botverify/internal/provider"
 )
@@ -62,46 +65,60 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code := strings.TrimSpace(strings.ToUpper(msg.Text))
-	if code == "" {
-		// A bare /start carries no code to confirm, but answering it matters:
-		// users who find the bot through search rather than a deep link would
-		// otherwise see no response at all. Other empty updates (stickers,
-		// photos) stay silent.
-		if msg.IsStart {
-			h.logger.Info("start command without payload", "provider", providerName)
-			_ = bp.SendReply(r.Context(), msg.ChatID, startMessage)
-		}
-		w.WriteHeader(http.StatusOK)
+	if err := h.Process(r.Context(), providerName, msg); err != nil {
+		h.logger.Error("bot message processing failed", "provider", providerName, "error", err)
+		http.Error(w, "temporary processing failure", http.StatusServiceUnavailable)
 		return
 	}
-
-	status, err := h.confirm(r, code, providerName, msg.ProviderUserID, msg.DisplayName)
-	if err != nil {
-		h.logger.Error("confirm call failed", "provider", providerName, "error", err)
-		_ = bp.SendReply(r.Context(), msg.ChatID, "Не удалось подтвердить код. Попробуйте ещё раз немного позже.")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	switch status {
-	case http.StatusOK:
-		h.logger.Info("verification confirmed",
-			"provider", providerName,
-			"provider_user_id", msg.ProviderUserID,
-		)
-		_ = bp.SendReply(r.Context(), msg.ChatID, "Код принят. Вернитесь в браузер и завершите вход.")
-	case http.StatusNotFound:
-		_ = bp.SendReply(r.Context(), msg.ChatID, "Код недействителен или уже истёк. Запросите новый код и попробуйте снова.")
-	default:
-		h.logger.Warn("unexpected confirm status", "status", status, "provider", providerName)
-		_ = bp.SendReply(r.Context(), msg.ChatID, "Что-то пошло не так. Попробуйте ещё раз.")
-	}
-
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *Handler) confirm(r *http.Request, code, providerName, providerUserID, displayName string) (int, error) {
+// Process is shared by webhook and polling delivery. An error prevents the
+// transport from acknowledging this update.
+func (h *Handler) Process(ctx context.Context, providerName string, msg *provider.IncomingMessage) error {
+	bp, ok := h.providers[providerName]
+	if !ok {
+		return fmt.Errorf("unknown bot provider")
+	}
+	code := strings.TrimSpace(strings.ToUpper(msg.Text))
+	reply := ""
+	if code == "" {
+		if !msg.IsStart {
+			return nil
+		}
+		reply = startMessage
+	} else {
+		status, err := h.confirm(ctx, code, providerName, msg.ProviderUserID, msg.DisplayName)
+		if err != nil {
+			return err
+		}
+		switch status {
+		case http.StatusOK:
+			h.logger.Info("verification confirmed", "provider", providerName)
+			reply = "Код принят. Вернитесь в браузер и завершите вход."
+		case http.StatusNotFound:
+			reply = "Код недействителен или уже истёк. Запросите новый код и попробуйте снова."
+		default:
+			return fmt.Errorf("confirm returned HTTP %d", status)
+		}
+	}
+	if err := bp.SendReply(ctx, msg.ChatID, reply); err != nil {
+		h.logger.Warn("bot reply failed", "provider", providerName, "error", err)
+		var permanent interface {
+			error
+			Permanent() bool
+		}
+		if errors.As(err, &permanent) && permanent.Permanent() {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (h *Handler) confirm(ctx context.Context, code, providerName, providerUserID, displayName string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 	body, _ := json.Marshal(map[string]string{
 		"code":             code,
 		"provider":         providerName,
@@ -109,7 +126,7 @@ func (h *Handler) confirm(r *http.Request, code, providerName, providerUserID, d
 		"display_name":     displayName,
 	})
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, h.confirmURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.confirmURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, fmt.Errorf("creating request: %w", err)
 	}

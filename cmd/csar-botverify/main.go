@@ -9,9 +9,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/ledatu/csar-botverify/internal/polling"
+	"github.com/ledatu/csar-core/lock"
+	"github.com/ledatu/csar-core/redisutil"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -84,12 +90,22 @@ func run(sf *configload.SourceFlags, logger *slog.Logger) error {
 
 	// --- Bot providers ---
 	providers := make(map[string]provider.BotProvider)
+	var pollingProvider *telegram.Provider
+	var pollingKey string
 	for _, pc := range cfg.Custom.Providers {
 		switch pc.Name {
 		case "telegram":
 			tg := telegram.New(pc.BotToken, pc.WebhookSecret, logger)
+			if err := tg.ConfigureNetwork(pc.Network); err != nil {
+				return err
+			}
+			if pc.Mode != "webhook" {
+				pollingProvider = tg
+				botID, _, _ := strings.Cut(pc.BotToken, ":")
+				pollingKey = "botverify:telegram:polling:" + botID
+			}
 			providers["telegram"] = tg
-			if pc.WebhookURL != "" {
+			if pc.Mode == "webhook" && pc.WebhookURL != "" {
 				if err := tg.RegisterWebhook(ctx, pc.WebhookURL); err != nil {
 					return fmt.Errorf("registering telegram webhook: %w", err)
 				}
@@ -112,8 +128,58 @@ func run(sf *configload.SourceFlags, logger *slog.Logger) error {
 		gatewayctx.Middleware,
 	)
 	readiness := health.NewReadinessChecker(Version, true)
+	registry := prometheus.NewRegistry()
+	pollingEnabled := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "botverify_polling_enabled", Help: "Whether this replica is configured to receive Telegram polls.",
+	})
+	registry.MustRegister(pollingEnabled)
+	if cfg.Custom.PollingActive {
+		pollingEnabled.Set(1)
+	}
+	metrics := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+	var pollingDone chan struct{}
+	if cfg.Custom.PollingActive {
+		redisCtx, redisCancel := context.WithTimeout(ctx, 5*time.Second)
+		rdb, err := redisutil.NewClient(redisCtx, cfg.Custom.Redis)
+		redisCancel()
+		if err != nil {
+			return fmt.Errorf("polling Redis: %w", err)
+		}
+		defer func() { _ = rdb.Close() }()
+		owner, err := os.Hostname()
+		if err != nil {
+			return fmt.Errorf("polling owner: %w", err)
+		}
+		receiver := &polling.Receiver{
+			Client: pollingProvider, Processor: relayHandler,
+			Locker: lock.NewRedisLocker(rdb), Key: pollingKey, Owner: owner, Logger: logger,
+		}
+		if err := receiver.Validate(); err != nil {
+			return err
+		}
+		receiver.RegisterMetrics(registry)
+		readiness.Register("polling", receiver.Readiness)
+		readiness.Register("polling_redis", func() health.CheckStatus {
+			checkCtx, checkCancel := context.WithTimeout(ctx, time.Second)
+			defer checkCancel()
+			if err := rdb.Ping(checkCtx).Err(); err != nil {
+				return health.CheckStatus{Status: "fail", Detail: "polling Redis unavailable"}
+			}
+			return health.CheckStatus{Status: "ok"}
+		})
+		pollingDone = make(chan struct{})
+		go func() {
+			defer close(pollingDone)
+			receiver.Run(ctx)
+		}()
+		defer func() {
+			cancel()
+			<-pollingDone
+		}()
+	}
 	readiness.Register("http_server", health.TCPDialCheck(fmt.Sprintf(":%d", cfg.Service.Port), time.Second))
 	if cfg.HealthPort == 0 {
+		r.Handle("/metrics", metrics)
 		r.Get("/health", health.Handler(Version))
 		r.Get("/readiness", readiness.Handler())
 	}
@@ -126,6 +192,7 @@ func run(sf *configload.SourceFlags, logger *slog.Logger) error {
 			Addr:      fmt.Sprintf(":%d", cfg.HealthPort),
 			Version:   Version,
 			Readiness: readiness,
+			Metrics:   metrics,
 			Logger:    logger,
 		})
 		if err != nil {
@@ -163,6 +230,7 @@ func run(sf *configload.SourceFlags, logger *slog.Logger) error {
 
 	logger.Info("service started", "name", cfg.Service.Name, "port", cfg.Service.Port, "tls", cfg.TLS.IsEnabled())
 	runErr := srv.Run(ctx)
+	cancel()
 	if healthSidecar != nil {
 		hctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

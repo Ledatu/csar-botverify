@@ -2,7 +2,6 @@
 package telegram
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ledatu/csar-botverify/internal/provider"
 )
@@ -22,16 +22,14 @@ type Provider struct {
 	token         string
 	webhookSecret string
 	client        *http.Client
-	logger        *slog.Logger
 }
 
 // New creates a Telegram bot provider.
-func New(token, webhookSecret string, logger *slog.Logger) *Provider {
+func New(token, webhookSecret string, _ *slog.Logger) *Provider {
 	return &Provider{
 		token:         token,
 		webhookSecret: webhookSecret,
-		client:        &http.Client{},
-		logger:        logger.With("bot_provider", "telegram"),
+		client:        &http.Client{Timeout: 35 * time.Second},
 	}
 }
 
@@ -121,6 +119,21 @@ func (p *Provider) ValidateWebhook(r *http.Request) bool {
 	return r.Header.Get("X-Telegram-Bot-Api-Secret-Token") == p.webhookSecret
 }
 
+type Update struct {
+	ID      int64 `json:"update_id"`
+	Message *struct {
+		From *struct {
+			ID        int64  `json:"id"`
+			FirstName string `json:"first_name"`
+			LastName  string `json:"last_name"`
+		} `json:"from"`
+		Chat struct {
+			ID int64 `json:"id"`
+		} `json:"chat"`
+		Text string `json:"text"`
+	} `json:"message"`
+}
+
 // ParseWebhook extracts the message from a Telegram Update payload.
 func (p *Provider) ParseWebhook(r *http.Request) (*provider.IncomingMessage, error) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -129,24 +142,20 @@ func (p *Provider) ParseWebhook(r *http.Request) (*provider.IncomingMessage, err
 	}
 	defer func() { _ = r.Body.Close() }()
 
-	var update struct {
-		Message *struct {
-			From *struct {
-				ID        int64  `json:"id"`
-				FirstName string `json:"first_name"`
-				LastName  string `json:"last_name"`
-			} `json:"from"`
-			Chat struct {
-				ID int64 `json:"id"`
-			} `json:"chat"`
-			Text string `json:"text"`
-		} `json:"message"`
-	}
+	var update Update
 	if err := json.Unmarshal(body, &update); err != nil {
 		return nil, fmt.Errorf("parsing update: %w", err)
 	}
 	if update.Message == nil || update.Message.From == nil {
 		return nil, fmt.Errorf("no message or sender in update")
+	}
+	return update.Incoming(), nil
+}
+
+// Incoming ignores non-message updates. It never treats them as confirmations.
+func (update Update) Incoming() *provider.IncomingMessage {
+	if update.Message == nil || update.Message.From == nil {
+		return nil
 	}
 
 	displayName := update.Message.From.FirstName
@@ -162,61 +171,23 @@ func (p *Provider) ParseWebhook(r *http.Request) (*provider.IncomingMessage, err
 		ChatID:         strconv.FormatInt(update.Message.Chat.ID, 10),
 		Text:           code,
 		IsStart:        bareStart,
-	}, nil
+	}
 }
 
 // RegisterWebhook calls the Telegram setWebhook API.
 func (p *Provider) RegisterWebhook(ctx context.Context, webhookURL string) error {
-	payload := map[string]string{
-		"url":          webhookURL,
-		"secret_token": p.webhookSecret,
-	}
-	body, _ := json.Marshal(payload)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiURL("setWebhook"), bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("creating request: %w", p.redactErr(err))
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("calling setWebhook: %w", p.redactErr(err))
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		return fmt.Errorf("setWebhook returned %d: %s", resp.StatusCode, p.redactString(string(respBody)))
-	}
-
-	p.logger.Info("telegram webhook registered", "url", webhookURL)
-	return nil
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return p.call(ctx, "setWebhook", map[string]string{
+		"url": webhookURL, "secret_token": p.webhookSecret,
+	}, nil)
 }
 
-// SendReply sends a text message to the specified chat.
+// SendReply returns an error for both transport and Telegram API failures.
 func (p *Provider) SendReply(ctx context.Context, chatID, text string) error {
-	payload := map[string]string{
-		"chat_id": chatID,
-		"text":    text,
-	}
-	body, _ := json.Marshal(payload)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiURL("sendMessage"), bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("creating request: %w", p.redactErr(err))
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("calling sendMessage: %w", p.redactErr(err))
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
-		p.logger.Warn("sendMessage failed", "status", resp.StatusCode, "body", p.redactString(string(respBody)))
-	}
-	return nil
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return p.call(ctx, "sendMessage", map[string]string{
+		"chat_id": chatID, "text": text,
+	}, nil)
 }

@@ -118,3 +118,20 @@ func TestHandleWebhookConfirmsCode(t *testing.T) {
 		t.Fatal("code path replied with startMessage, want the acceptance message")
 	}
 }
+
+func TestWebhookDoesNotAcknowledgeTemporaryConfirmationFailure(t *testing.T) {
+	fp := &fakeProvider{msg: &provider.IncomingMessage{ChatID: "99", Text: "ABC123"}}
+	h, calls := newTestHandler(t, fp, http.StatusServiceUnavailable)
+	rec := serve(h)
+	if rec.Code != http.StatusServiceUnavailable || *calls != 1 || len(fp.replies) != 0 {
+		t.Fatal("temporary confirmation failure was acknowledged or sent a misleading reply")
+	}
+}
+
+func TestWebhookExpiredCodeIsTerminal(t *testing.T) {
+	fp := &fakeProvider{msg: &provider.IncomingMessage{ChatID: "99", Text: "ABC123"}}
+	h, _ := newTestHandler(t, fp, http.StatusNotFound)
+	if rec := serve(h); rec.Code != http.StatusOK || len(fp.replies) != 1 {
+		t.Fatal("expired code must be acknowledged with an expiry reply")
+	}
+}

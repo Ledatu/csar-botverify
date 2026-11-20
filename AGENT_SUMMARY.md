@@ -1,7 +1,7 @@
 # csar-botverify Agent Summary
 
 ## Role In Prod
-Webhook bridge for bot verification. It receives provider callbacks, extracts verification codes, and relays a confirm call to `csar-authn` through the csar router using STS service tokens.
+Webhook and elected long-polling relay for bot verification. It receives provider callbacks, extracts verification codes, and relays a confirm call to `csar-authn` through the csar router using STS service tokens.
 
 ## Runtime Entry Points
 - `cmd/csar-botverify/main.go` loads config, registers providers, starts webhook handling, and runs the HTTP server.
@@ -26,7 +26,7 @@ Webhook bridge for bot verification. It receives provider callbacks, extracts ve
 ## Audit Hotspots
 - The webhook route is public and has no explicit router throttling in prod config.
 - Telegram webhook registration uses synchronous startup HTTP calls, so a slow upstream can block startup.
-- Outbound HTTP clients should always have explicit timeouts.
+- Telegram calls have bounded timeouts, explicit address-family selection and redacted errors.
 - The dirty `cmd/csar-botverify/main.go` sidecar bind uses `:%d`; if kept,
   treat health/readiness as all-interface listeners and constrain them with
   compose/network policy rather than assuming loopback-only exposure.
@@ -47,3 +47,17 @@ Webhook bridge for bot verification. It receives provider callbacks, extracts ve
 - `go build ./...`
 - `go test ./... -count=1`
 - `golangci-lint run ./...`
+
+
+## Telegram polling
+- Provider mode defaults to webhook. polling_standby serves webhooks but never
+  registers one or receives polls. polling activates an elected receiver.
+- Only csar-core supplies shared primitives. lock.SessionLocker and
+  redisutil.Config/NewClient are generic CSAR packages. No Aurum dependency.
+- Redis session ownership loss cancels in-flight work. Telegram offsets advance
+  after successful processing. No startup path deletes the webhook.
+- Deploy retry-compatible authn first. An interrupted confirmation or reply can
+  replay an update. A reply may repeat after a crash, while authn consumption
+  prevents issuing another session from an already consumed verification.
+- Health includes Redis and receiver progress. The health sidecar exposes
+  polling mode/ownership, success timestamps and error counters at /metrics.
