@@ -35,7 +35,11 @@ func (p *Provider) ConfigureNetwork(network string) error {
 	}
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
+	// Preserve existing proxy behavior for the default dual-stack mode.
+	// An explicit address family selects a direct Telegram connection.
+	if network != "tcp" {
+		transport.Proxy = nil
+	}
 	transport.DialContext = func(ctx context.Context, _, address string) (net.Conn, error) {
 		return dialer.DialContext(ctx, network, address)
 	}
